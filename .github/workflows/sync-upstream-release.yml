@@ -1,0 +1,166 @@
+name: Sync upstream and publish NH_CreationEngine
+
+on:
+  schedule:
+    # GitHub cron uses UTC, and may be delayed.
+    - cron: '5,15,25,35,45,55 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+concurrency:
+  group: nh-creation-engine-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync official berichan upstream
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      build_sha: ${{ steps.sync.outputs.build_sha }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      tag: ${{ steps.sync.outputs.tag }}
+      needs_release: ${{ steps.sync.outputs.needs_release }}
+    steps:
+      - name: Checkout official tracking branch
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Compare with upstream and merge without force
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/berichan/NH_CreationEngine.git
+          git fetch --no-tags upstream master
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            git merge --no-edit "$upstream_sha"
+            git push origin HEAD:master
+          fi
+          build_sha="$(git rev-parse HEAD)"
+          tag="upstream-${upstream_sha:0:12}"
+          echo "build_sha=$build_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "needs_release=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream commit already released: $upstream_sha"
+          else
+            echo "needs_release=true" >> "$GITHUB_OUTPUT"
+            echo "Build/release required: $upstream_sha"
+          fi
+
+  build:
+    name: Build both NH_CreationEngine tools
+    needs: sync
+    if: needs.sync.outputs.needs_release == 'true'
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout synchronized source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.build_sha }}
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish Windows executables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'NHCE_src'
+          $engineProject = Join-Path $sourceRoot 'NH_CreationEngine/NH_CreationEngine.csproj'
+          $sysbotProject = Join-Path $sourceRoot 'NH_Sysbot_Tools/NH_Sysbot_Tools.csproj'
+          $outputRoot = Join-Path $env:RUNNER_TEMP 'nh-creation-engine-packages'
+          $engineOut = Join-Path $outputRoot 'NH_CreationEngine'
+          $sysbotOut = Join-Path $outputRoot 'NH_Sysbot_Tools'
+          New-Item -ItemType Directory -Force -Path $engineOut, $sysbotOut | Out-Null
+          $solutionDir = "$sourceRoot\"
+
+          # Build from upstream master without modifying its source projects.
+          # Override EOL netcoreapp3.1 with .NET 10 for supported runtime packages.
+          dotnet publish $engineProject -c Release -r win-x64 --self-contained true "-p:TargetFramework=net10.0" "-p:SolutionDir=$solutionDir" -o $engineOut
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet publish $sysbotProject -c Release -r win-x64 --self-contained true "-p:TargetFramework=net10.0" "-p:SolutionDir=$solutionDir" -o $sysbotOut
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if (-not (Test-Path (Join-Path $engineOut 'NH_CreationEngine.exe') -PathType Leaf)) {
+            throw 'NH_CreationEngine.exe missing'
+          }
+          if (-not (Test-Path (Join-Path $sysbotOut 'NH_Sysbot_Tools.exe') -PathType Leaf)) {
+            throw 'NH_Sysbot_Tools.exe missing'
+          }
+
+          # Runtime inputs are part of the distribution; no copyrighted game data is bundled.
+          Copy-Item -LiteralPath (Join-Path $sourceRoot 'NH_CreationEngine/Template_cs') -Destination (Join-Path $engineOut 'Template_cs') -Recurse -Force
+          Copy-Item -LiteralPath (Join-Path $sourceRoot 'NH_CreationEngine/DumpFiles') -Destination (Join-Path $engineOut 'DumpFiles') -Recurse -Force
+          foreach ($dll in 'NHSE.Core.dll', 'NHSE.Parsing.dll') {
+            if (-not (Test-Path (Join-Path $engineOut $dll))) {
+              Copy-Item -LiteralPath (Join-Path $sourceRoot "NH_CreationEngine/NHSE/$dll") -Destination (Join-Path $engineOut $dll)
+            }
+          }
+
+          Compress-Archive -Path (Join-Path $engineOut '*') -DestinationPath (Join-Path $outputRoot 'NH_CreationEngine-win-x64.zip') -Force
+          Compress-Archive -Path (Join-Path $sysbotOut '*') -DestinationPath (Join-Path $outputRoot 'NH_Sysbot_Tools-win-x64.zip') -Force
+          foreach ($zip in 'NH_CreationEngine-win-x64.zip', 'NH_Sysbot_Tools-win-x64.zip') {
+            if (-not (Test-Path (Join-Path $outputRoot $zip) -PathType Leaf)) { throw "Missing release archive $zip" }
+          }
+
+      - name: Upload both Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: NH_CreationEngine-packages
+          path: ${{ runner.temp }}/nh-creation-engine-packages/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [sync, build]
+    if: needs.sync.outputs.needs_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download both packages
+        uses: actions/download-artifact@v4
+        with:
+          name: NH_CreationEngine-packages
+          path: dist
+
+      - name: Create unique release by upstream revision
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          BUILD_SHA: ${{ needs.sync.outputs.build_sha }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          test -s dist/NH_CreationEngine-win-x64.zip
+          test -s dist/NH_Sysbot_Tools-win-x64.zip
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Already published: $TAG"
+            exit 0
+          fi
+          printf 'Automated Windows x64 builds of both NH_CreationEngine tools.\n\nUpstream source: https://github.com/berichan/NH_CreationEngine\nUpstream commit: %s\nBuild commit: %s\n\nThe source targets EOL .NET Core 3.1. These packages are rebuilt against .NET 10 without source changes; functional compatibility with external NHSE binaries and actual game data is not guaranteed. Please test with your own legally dumped data.\n\nNH_CreationEngine requires your locally extracted ACNH resource files, and NH_Sysbot_Tools requires your own configured Switch/sys-botbase environment. No game data is included.\n' "$UPSTREAM_SHA" "$BUILD_SHA" > notes.md
+          gh release create "$TAG" dist/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$BUILD_SHA" \
+            --title "NH_CreationEngine Windows x64 ($TAG)" \
+            --notes-file notes.md \
+            --latest
