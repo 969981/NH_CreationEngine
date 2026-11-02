@@ -101,7 +101,7 @@ jobs:
             $xml = $xml.Replace('<TargetFramework>netcoreapp3.1</TargetFramework>', '<TargetFramework>net10.0</TargetFramework>')
             Set-Content -LiteralPath $project -Value $xml -Encoding utf8
           }
-          dotnet publish $engineProject -c Release -r win-x64 --self-contained true "-p:SolutionDir=$solutionDir" -o $engineOut
+          dotnet publish $engineProject -c Release -r win-x64 --self-contained true "-p:AllowUnsafeBlocks=true" "-p:SolutionDir=$solutionDir" -o $engineOut
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           dotnet publish $sysbotProject -c Release -r win-x64 --self-contained true "-p:SolutionDir=$solutionDir" -o $sysbotOut
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
