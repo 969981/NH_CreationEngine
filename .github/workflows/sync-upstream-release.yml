@@ -91,11 +91,19 @@ jobs:
           New-Item -ItemType Directory -Force -Path $engineOut, $sysbotOut | Out-Null
           $solutionDir = "$sourceRoot\"
 
-          # Build from upstream master without modifying its source projects.
-          # Override EOL netcoreapp3.1 with .NET 10 for supported runtime packages.
-          dotnet publish $engineProject -c Release -r win-x64 --self-contained true "-p:TargetFramework=net10.0" "-p:SolutionDir=$solutionDir" -o $engineOut
+          # Patch framework targets only within this temporary Actions checkout.
+          # This keeps both NuGet restore and compilation on net10.0.
+          foreach ($project in @($engineProject, $sysbotProject)) {
+            $xml = Get-Content -LiteralPath $project -Raw
+            if (-not $xml.Contains('<TargetFramework>netcoreapp3.1</TargetFramework>')) {
+              throw "Unexpected target framework in $project"
+            }
+            $xml = $xml.Replace('<TargetFramework>netcoreapp3.1</TargetFramework>', '<TargetFramework>net10.0</TargetFramework>')
+            Set-Content -LiteralPath $project -Value $xml -Encoding utf8
+          }
+          dotnet publish $engineProject -c Release -r win-x64 --self-contained true "-p:SolutionDir=$solutionDir" -o $engineOut
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          dotnet publish $sysbotProject -c Release -r win-x64 --self-contained true "-p:TargetFramework=net10.0" "-p:SolutionDir=$solutionDir" -o $sysbotOut
+          dotnet publish $sysbotProject -c Release -r win-x64 --self-contained true "-p:SolutionDir=$solutionDir" -o $sysbotOut
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           if (-not (Test-Path (Join-Path $engineOut 'NH_CreationEngine.exe') -PathType Leaf)) {
